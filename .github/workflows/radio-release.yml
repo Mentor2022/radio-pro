@@ -1,1 +1,139 @@
+# Radio Pro release build. Started by the App Builder Portal (Admin > Radio Pro > Build).
+# The repo root must hold this project (build.gradle.kts, settings.gradle.kts, app/).
+#
+# Secrets this file reads (Settings > Secrets and variables > Actions). If your other apps use different
+# names for the signing key, change the four names in the "Signing key" step to match.
+#   KEYSTORE_BASE64, KEYSTORE_PASSWORD, KEY_ALIAS, KEY_PASSWORD
+#
+# The portal looks for a release tagged rp-<build_id> holding <build_id>.apk and <build_id>.aab.
+name: Radio Pro release
 
+on:
+  workflow_dispatch:
+    inputs:
+      build_id:
+        description: Build id made by the portal (12 hex characters)
+        required: true
+      app_name:
+        description: App name shown under the icon
+        required: true
+        default: Radio Pro
+      version_name:
+        description: Version name
+        required: true
+      version_code:
+        description: Version code (always goes up)
+        required: true
+      release_notes:
+        description: What is new
+        required: false
+        default: ''
+      icon_url:
+        description: Signed link to the icon (empty = built-in icon)
+        required: false
+        default: ''
+      icon_bg:
+        description: Icon background colour
+        required: false
+        default: '#0F766E'
+      config_json:
+        description: Settings for assets/config.json (features, default country and state)
+        required: false
+        default: '{}'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      BUILD_ID: ${{ inputs.build_id }}
+      APP_NAME: ${{ inputs.app_name }}
+      VERSION_NAME: ${{ inputs.version_name }}
+      VERSION_CODE: ${{ inputs.version_code }}
+      RELEASE_NOTES: ${{ inputs.release_notes }}
+      ICON_URL: ${{ inputs.icon_url }}
+      ICON_BG: ${{ inputs.icon_bg }}
+      CONFIG_JSON: ${{ inputs.config_json }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check inputs
+        run: |
+          [[ "$BUILD_ID" =~ ^[0-9a-f]{12}$ ]] || { echo "Bad build id"; exit 1; }
+          [[ "$VERSION_CODE" =~ ^[0-9]{1,9}$ ]] || { echo "Bad version code"; exit 1; }
+          [[ "$VERSION_NAME" =~ ^[0-9A-Za-z._-]{1,20}$ ]] || { echo "Bad version name"; exit 1; }
+          [[ "$ICON_BG" =~ ^#[0-9A-Fa-f]{6}$ ]] || { echo "Bad icon colour"; exit 1; }
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.11.1
+
+      - name: Accept Android licences
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - name: App settings (assets/config.json)
+        run: |
+          mkdir -p app/src/main/assets
+          printf '%s' "$CONFIG_JSON" | jq -e 'type == "object"' > /dev/null
+          printf '%s' "$CONFIG_JSON" | jq -c . > app/src/main/assets/config.json
+          cat app/src/main/assets/config.json
+
+      - name: Icon colour and custom icon
+        run: |
+          printf '<?xml version="1.0" encoding="utf-8"?>\n<resources>\n    <color name="ic_launcher_background">%s</color>\n</resources>\n' "$ICON_BG" > app/src/main/res/values/ic_launcher_background.xml
+          if [ -n "$ICON_URL" ]; then
+            curl -fsSL --max-time 60 -o "$RUNNER_TEMP/icon.png" "$ICON_URL"
+            IM=$(command -v magick || command -v convert || true)
+            if [ -z "$IM" ]; then sudo apt-get update -qq && sudo apt-get install -y -qq imagemagick; IM=$(command -v convert); fi
+            # adaptive icon foreground: picture at 2/3 size, centred in the safe zone
+            rm -f app/src/main/res/drawable/ic_launcher_foreground.xml
+            mkdir -p app/src/main/res/drawable-nodpi
+            "$IM" "$RUNNER_TEMP/icon.png" -resize 288x288 -background none -gravity center -extent 432x432 app/src/main/res/drawable-nodpi/ic_launcher_foreground.png
+          fi
+
+      - name: Signing key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+            {
+              echo "KEYSTORE_PATH=$RUNNER_TEMP/release.jks"
+              echo "KEYSTORE_PASSWORD=$KEYSTORE_PASSWORD"
+              echo "KEY_ALIAS=$KEY_ALIAS"
+              echo "KEY_PASSWORD=$KEY_PASSWORD"
+            } >> "$GITHUB_ENV"
+          else
+            echo "No signing key found: the build will be signed with the debug key and cannot go to Google Play."
+          fi
+
+      - name: Build APK and AAB
+        run: |
+          set -o pipefail
+          gradle :app:assembleRelease :app:bundleRelease --no-daemon --stacktrace 2>&1 | tee build.log
+
+      - name: Show build errors
+        if: failure()
+        run: |
+          grep -E "error:|^e: |FAILED|What went wrong" -A4 build.log | head -80 || true
+
+      - name: Publish release for the portal
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp app/build/outputs/apk/release/app-release.apk "$BUILD_ID.apk"
+          cp app/build/outputs/bundle/release/app-release.aab "$BUILD_ID.aab"
+          NOTES="${RELEASE_NOTES:-Radio Pro build $VERSION_NAME}"
+          gh release create "rp-$BUILD_ID" "$BUILD_ID.apk" "$BUILD_ID.aab" \
+            --title "$APP_NAME $VERSION_NAME" --notes "$NOTES"
